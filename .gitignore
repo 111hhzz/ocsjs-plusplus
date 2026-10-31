@@ -149,3 +149,6 @@ tests/image/
 
 # 开发工具 
 .codebuddy/
+
+# macOS 文件夹元数据（非代码，跨平台无意义）
+.DS_Store
