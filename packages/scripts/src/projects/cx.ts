@@ -43,6 +43,13 @@ import { waitForElement, waitForMedia } from '../utils/study';
  */
 const CX_SECRET_REF_TABLE_URL = 'https://cdn.ocsjs.com/resources/font/font_ref_cx.bin';
 
+/**
+ * 加密文字解密任务（Promise）。供答题器在读取题面/选项文本前等待解密完成，
+ * 避免"AI 先读取到未解密的密文"的竞态（解密需联网拉特征表+加载字体，较慢）。
+ * 由 cxSecretFontRecognize 脚本的 oncomplete 赋值；未检测到加密/脚本未运行时为 undefined（空操作）。
+ */
+let secretFontDecryptTask: Promise<void> | undefined;
+
 const HIGHT_PLAYBACK_RATE_WARNS = [
 	'⚠️高倍速、夜间、白天大量运行 等情况\n可能导致学习记录清空/回退',
 	'⚠️超星后台可以看到学习时长，请谨慎设置',
@@ -787,9 +794,10 @@ export const CXProject = Project.create({
 				['考试整卷预览', '/mooc2/exam/preview'],
 				['作业', '/mooc2/work/dowork']
 			],
-			async oncomplete() {
-				await mappingRecognize();
-			}
+		async oncomplete() {
+			secretFontDecryptTask = mappingRecognize();
+			await secretFontDecryptTask;
+		}
 		}),
 		// 积分课提示
 		jfkGuide: new Script({
@@ -1045,21 +1053,25 @@ function workOrExam(
 				optionText: (option) => extractTextWithImages(option).text
 			})
 		);
-		worker
-			.doWork({ enable_debug: BackgroundProject.scripts.dev.cfg.enable_answerer_debug })
-			.then(() => {
-				$message.info({ content: '作业/考试完成，请自行检查后保存或提交。', duration: 0 });
-				worker.emit('done');
-			})
-			.catch((err) => {
-				console.error(err);
-				$message.error('答题程序发生错误 : ' + err.message);
-			});
+			(async () => {
+				if (secretFontDecryptTask) await secretFontDecryptTask;
+				worker
+					.doWork({ enable_debug: BackgroundProject.scripts.dev.cfg.enable_answerer_debug })
+					.then(() => {
+						$message.info({ content: '作业/考试完成，请自行检查后保存或提交。', duration: 0 });
+						worker.emit('done');
+					})
+					.catch((err) => {
+						console.error(err);
+						$message.error('答题程序发生错误 : ' + err.message);
+					});
+			})();
 	} else {
 		const getNextBtn = () => document.querySelector('[onclick="getTheNextQuestion(1)"]') as HTMLElement;
 		let next = getNextBtn();
 
 		(async () => {
+			if (secretFontDecryptTask) await secretFontDecryptTask;
 			while (next && worker.isClose === false) {
 				await worker.doWork({ enable_debug: BackgroundProject.scripts.dev.cfg.enable_answerer_debug });
 				if (worker.isClose) break;
@@ -1214,38 +1226,40 @@ function mobilelearn(opts: CommonWorkOptions) {
  * @see 算法详解见 utils/font-decrypt/bitmap.ts 文件头注释
  * @see 参考 https://bbs.tampermonkey.net.cn/thread-2303-1-1.html
  */
-async function mappingRecognize(doc: Document = document) {
-	// 从 @font-face 的 data URI 中提取加密字体
-	const fontBuffer = extractFontFromStyle(doc, 'font-cxsecret');
-	if (!fontBuffer) {
-		$console.log('未检测到加密文字。');
-		return;
-	}
-	const fonts = CXAnalyses.getSecretFont(doc);
-	if (fonts.length === 0) {
-		return;
-	}
-
-	const t = Date.now();
-	try {
-		// 只破解页面实际出现的字符（通常几十个），避免全字表扫描
-		const { map, details } = await crackFont(fontBuffer, collectChars(fonts), {
-			refTableUrl: CX_SECRET_REF_TABLE_URL,
-			onProgress: (done, total) => console.log(`加密文字识别中 ${done}/${total}`)
-		});
-		const lowMargin = details.filter((d) => d.margin < 0.3);
-		if (lowMargin.length > 0) {
-			const msg = `有 ${lowMargin.length} 个字符识别置信度较低，可能存在误差`;
-			$console.warn(msg);
-			console.log(msg, lowMargin);
+function mappingRecognize(doc: Document = document): Promise<void> {
+	return (async () => {
+		// 从 @font-face 的 data URI 中提取加密字体
+		const fontBuffer = extractFontFromStyle(doc, 'font-cxsecret');
+		if (!fontBuffer) {
+			$console.log('未检测到加密文字。');
+			return;
 		}
-		decryptElements(fonts, map);
-		fonts.forEach((el) => el.classList.remove('font-cxsecret')); // 移除字体加密
-		$console.info('文字解密完成，耗时 ' + ((Date.now() - t) / 1000).toFixed(1) + ' 秒');
-	} catch (err) {
-		$console.error('加密文字识别失败：', String(err));
-		$message.error('加密文字识别失败：' + String(err));
-	}
+		const fonts = CXAnalyses.getSecretFont(doc);
+		if (fonts.length === 0) {
+			return;
+		}
+
+		const t = Date.now();
+		try {
+			// 只破解页面实际出现的字符（通常几十个），避免全字表扫描
+			const { map, details } = await crackFont(fontBuffer, collectChars(fonts), {
+				refTableUrl: CX_SECRET_REF_TABLE_URL,
+				onProgress: (done, total) => console.log(`加密文字识别中 ${done}/${total}`)
+			});
+			const lowMargin = details.filter((d) => d.margin < 0.3);
+			if (lowMargin.length > 0) {
+				const msg = `有 ${lowMargin.length} 个字符识别置信度较低，可能存在误差`;
+				$console.warn(msg);
+				console.log(msg, lowMargin);
+			}
+			decryptElements(fonts, map);
+			fonts.forEach((el) => el.classList.remove('font-cxsecret')); // 移除字体加密
+			$console.info('文字解密完成，耗时 ' + ((Date.now() - t) / 1000).toFixed(1) + ' 秒');
+		} catch (err) {
+			$console.error('加密文字识别失败：', String(err));
+			$message.error('加密文字识别失败：' + String(err));
+		}
+	})();
 }
 
 /**
